@@ -8,7 +8,6 @@ import argparse
 import textwrap
 import matplotlib.pyplot as plt
 
-
 from pysurfonoi_workers import *
 
 
@@ -65,7 +64,7 @@ if args.wt:
     establish_worker_table(dbName, dbUser, dbPass)
 if args.cont:
     print('> establishing contours')
-    contouring(dbName, dbUser, dbPass)
+    establish_contours(dbName, dbUser, dbPass)
 
 if args.status == 'm':
     print('> retrieving status of measurements')
