@@ -33,6 +33,8 @@ parser.add_argument('-u', default=None, type=str, help='database user')
 parser.add_argument('-pw', default='', type=str, help='database password')
 parser.add_argument('-load', metavar='input.shp', default=None, type=str,
                     help='load measurements from shapefile, inputfile.shp')
+parser.add_argument('-loadmask', metavar='input.shp', default=None, type=str,
+                    help='load mask polygon from shapefile, inputfile.shp')
 parser.add_argument('-status', default=None, type=str, help='retrieve status')
 #parser.add_argument('-vis', default=None, type=str, help='visualize features')
 parser.add_argument("-vis", choices=["m", "d", "v"], type=str, help="visualize features")
@@ -40,6 +42,10 @@ parser.add_argument('-tri', action='store_true', help='constructs the delaunay t
 parser.add_argument('-vor', action='store_true', help='constructs the voronoi diagram')
 parser.add_argument('-wt', action='store_true', help='establishes the worker table')
 parser.add_argument('-cont', action='store_true', help='contours')
+
+parser.add_argument('-cout', default=None, type=str,
+                    help='contour shapefile', metavar='contour_output.shp')
+parser.add_argument('-c', action='append', type=float, help='isobaths values')
 
 
 args = parser.parse_args()
@@ -53,6 +59,9 @@ if args.dft:
 if args.load:
     print('> loading measurements')
     load_measurements(dbName, dbUser, dbPass, args.load)
+if args.loadmask:
+    print('> loading mask')
+    load_mask(dbName, dbUser, dbPass, args.loadmask)
 if args.tri:
     print('> constructing Delaunay triangulation')
     construct_delaunay(dbName, dbUser, dbPass)
@@ -79,3 +88,8 @@ if args.vis in ['d', 'v']:
     elif args.vis == 'v':
         print('> visualizing voronoi cells')
         visualize_delaunay_voronoi(dbName, dbUser, dbPass, 'voronoi_cells')
+
+if args.cout and args.c:
+    print('> constructing and exporting contours\n  output: {}\n  isobaths: {}'.format(args.cout, args.c))
+    #export_contours(dbName, dbUser, dbPass, args.cout, args.c)
+    manual_contours(dbName, dbUser, dbPass, args.cout, args.c)

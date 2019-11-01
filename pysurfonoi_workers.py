@@ -12,6 +12,10 @@ import shapely.wkt
 from shapely.geometry import Point, LineString, Polygon
 import numpy as np
 
+import sys
+import subprocess
+import os
+
 import geopandas as gpd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -32,6 +36,16 @@ def are_perpendicular(lineOne, lineTwo):
     orthoValue = abs(scalarProduct/(lineOne.length*lineTwo.length))
 
     return orthoValue
+
+
+def progressBar(value, endvalue, bar_length=30):
+    # https://stackoverflow.com/a/37630397
+    percent = float(value) / endvalue
+    arrow = '#' * int(round(percent * bar_length))  # + '>'
+    spaces = ' ' * (bar_length - len(arrow))
+
+    sys.stdout.write("\rProgress: [{0}] {1}%".format(arrow + spaces, int(round(percent * 100))))
+    sys.stdout.flush()
 
 
 def get_default_database(dftFile='default_db'):
@@ -56,7 +70,7 @@ def load_measurements(dbName, dbUser, dbPass, inputMeasurements):
     cursor.execute('DROP TABLE IF EXISTS measurements')
     cursor.execute(
         'CREATE TABLE measurements (id SERIAL PRIMARY KEY, pos GEOMETRY, depth NUMERIC)')
-    cursor.execute('CREATE INDEX measurements_index ON measuremets USING GIST(pos)')
+    cursor.execute('CREATE INDEX measurements_index ON measurements USING GIST(pos)')
 
     # load points from shapefile
     shapefile = osgeo.ogr.Open(inputMeasurements)
@@ -69,6 +83,32 @@ def load_measurements(dbName, dbUser, dbPass, inputMeasurements):
         # Insert data into database, converting WKT geometry to a PostGIS geometry
         cursor.execute(
             "INSERT INTO measurements (pos, depth) VALUES (ST_GeomFromText('{}'), {})".format(wkt, depth))
+
+    connection.commit()
+
+    return
+
+
+def load_mask(dbName, dbUser, dbPass, inputMask):
+    # inserts mask (polygon) from a shapefile into the database in a table called mask
+    connection, cursor = db_connection(dbName, dbUser, dbPass)
+
+    # create table
+    cursor.execute('DROP TABLE IF EXISTS mask')
+    cursor.execute(
+        'CREATE TABLE mask (id SERIAL PRIMARY KEY, geom GEOMETRY)')
+    cursor.execute('CREATE INDEX mask_index ON mask USING GIST(geom)')
+
+    # load points from shapefile
+    shapefile = osgeo.ogr.Open(inputMask)
+    layer = shapefile.GetLayer(0)
+    for i in range(layer.GetFeatureCount()):
+        feature = layer.GetFeature(i)
+        geometry = feature.GetGeometryRef()
+        wkt = geometry.ExportToWkt()
+        # Insert data into database, converting WKT geometry to a PostGIS geometry
+        cursor.execute(
+            "INSERT INTO mask (geom) VALUES (ST_GeomFromText('{}'))".format(wkt))
 
     connection.commit()
 
@@ -94,6 +134,11 @@ def construct_delaunay(dbName, dbUser, dbPass):
 
     connection.commit()
 
+    # select d.geom
+    # from delaunay_cells d,
+    # 	mask m
+    # WHERE ST_Within(d.geom, m.geom);
+
     return
 
 
@@ -115,6 +160,10 @@ def construct_voronoi(dbName, dbUser, dbPass):
             "INSERT INTO voronoi_cells (geom) VALUES (ST_GeomFromText('{}'))".format(cell[0]))
 
     connection.commit()
+
+    # SELECT ST_Intersection(ST_Buffer(a.geom,50), b.geom) AS geom
+    # FROM mask a
+    # CROSS JOIN voronoi_cells b;
 
     return
 
@@ -175,6 +224,9 @@ def visualize_delaunay_voronoi(dbName, dbUser, dbPass, dOrV):
 def establish_worker_table(dbName, dbUser, dbPass):
     connection, cursor = db_connection(dbName, dbUser, dbPass)
 
+    # some generic info
+    nrMeasurements = len(get_measurements(dbName, dbUser, dbPass))
+
     # create table
     cursor.execute('DROP TABLE IF EXISTS interpolator')
     cursor.execute(
@@ -183,9 +235,16 @@ def establish_worker_table(dbName, dbUser, dbPass):
 
     # find the voronoi cell and neighboring triangles for each measurement
     cursor.execute('SELECT m.id mid, ARRAY_AGG(v.id) vids, ARRAY_AGG(d.id) dids FROM measurements m JOIN voronoi_cells v ON ST_Contains(v.geom, m.pos) JOIN delaunay_cells d ON ST_Intersects(m.pos, d.geom) GROUP BY m.id ORDER BY m.id')
-    print('> found voronois and delaunays..')
 
+    print('> found voronois and delaunays..')
+    print('> iterating over every measurement..')
+
+    nr = 0
     for measurement in cursor.fetchall():
+
+        # print progress
+        progressBar(nr, nrMeasurements)
+
         # select the measurement
         cursor.execute(
             'SELECT ST_AsText(pos) FROM measurements WHERE id = {}'.format(measurement[0]))
@@ -238,10 +297,11 @@ def establish_worker_table(dbName, dbUser, dbPass):
                 # v_i
                 distanceVoronoi = voronoiTwin.length
 
-                #print('\n--Measurement--\mid:\t\t{}\nnid:\t\t{}'.format(measurement[0], neighborId))
+                # print('\n--Measurement--\mid:\t\t{}\nnid:\t\t{}'.format(measurement[0], neighborId))
                 cursor.execute(
                     "INSERT INTO interpolator (mid, neighbor_id, distance_d, distance_v) VALUES ({}, {}, {}, {})".format(measurement[0], neighborId, distanceDelaunay, distanceVoronoi))
                 connection.commit()
+        nr += 1
 
     connection.commit()
 
@@ -251,8 +311,8 @@ def establish_worker_table(dbName, dbUser, dbPass):
 def establish_contours(dbName, dbUser, dbPass):
     connection, cursor = db_connection(dbName, dbUser, dbPass)
 
-    measurementLimit = 10
-    contourLimit = 10
+    measurementLimit = 500
+    contourLimit = 500
     # SELECT (contour_lines(ARRAY(SELECT pos FROM measurements LIMIT 100), ARRAY(SELECT depth FROM measurements LIMIT 100), array[2.0,5.0,8.0])).* FROM measurements LIMIT 100;
 
     cursor.execute(function_get_cell_intersects())
@@ -261,6 +321,169 @@ def establish_contours(dbName, dbUser, dbPass):
     # create table
     cursor.execute('DROP TABLE IF EXISTS contour_lines_output')
     cursor.execute(
-        "SELECT (contour_lines(ARRAY(SELECT pos FROM measurements LIMIT {}), ARRAY(SELECT depth FROM measurements LIMIT {}), array[2.0,4,5,8,10])).* INTO contour_lines_output FROM measurements LIMIT {}".format(measurementLimit, measurementLimit, contourLimit))
+        "SELECT (contour_lines(ARRAY(SELECT pos FROM measurements LIMIT {}), ARRAY(SELECT depth FROM measurements LIMIT {}), array[2.0])).* INTO contour_lines_output FROM measurements LIMIT {}".format(measurementLimit, measurementLimit, contourLimit))
 
     connection.commit()
+    return
+
+
+def export_contours(dbName, dbUser, dbPass, outputFile, breaks):
+    connection, cursor = db_connection(dbName, dbUser, dbPass)
+    serverLocation = 'localhost'
+
+    measurementLimit = 100
+    contourLimit = 10
+
+    cursor.execute(function_get_cell_intersects())
+    cursor.execute(function_contour_lines())
+
+    breakList = str(breaks)
+
+    # contour lines as SQL
+    # create table
+    cursor.execute('DROP TABLE IF EXISTS contour_lines_export')
+    connection.commit()
+    sqlString = 'SELECT (contour_lines(ARRAY(SELECT pos FROM measurements LIMIT {}),ARRAY(SELECT depth FROM measurements LIMIT {}),ARRAY{})).* INTO contour_lines_export FROM measurements LIMIT {}'.format(
+        measurementLimit, measurementLimit, breakList, contourLimit)
+    # unlimited contours
+    sqlString = 'SELECT (contour_lines(ARRAY(SELECT pos FROM measurements LIMIT {}),ARRAY(SELECT depth FROM measurements LIMIT {}),ARRAY{})).* INTO contour_lines_export FROM measurements'.format(
+        measurementLimit, measurementLimit, breakList)
+    # print(sqlString)
+    cursor.execute(sqlString)
+    connection.commit()
+
+    print('> contours saved to table')
+    print('> exporting to shapefile')
+
+    cwd = os.getcwd()
+    cwd = ''
+    filePath = os.path.join(cwd, outputFile)
+
+    shpString = 'SELECT * FROM contour_lines_export'
+    subprocess.call(['pgsql2shp', '-f', filePath, '-h', serverLocation, '-u',
+                     dbUser, '-P', dbPass, dbName, shpString])
+
+    connection.commit()
+
+
+def manual_contours(dbName, dbUser, dbPass, outputFile, breaks):
+    # creates delaunay triangles and stores the polygons into table delaunay_cells
+    connection, cursor = db_connection(dbName, dbUser, dbPass)
+
+    cursor.execute(
+        'SELECT ST_AsText((ST_Dump(geom)).geom) As triangle FROM(SELECT ST_DelaunayTriangles(ST_Collect(ST_MakePoint(ST_X(pos), ST_Y(pos), depth))) As geom FROM measurements) AS foo')
+
+    contour_lines = []
+    for tri in cursor.fetchall():
+        # print('\n---NEW TRIANGLE---')
+        # print(tri[0])
+        triangle = shapely.wkt.loads(tri[0])
+        triangleCoords = triangle.exterior.coords
+        zValues = [triangleCoords[0][2], triangleCoords[1][2], triangleCoords[2][2]]
+        zMin = min(zValues)
+        zMax = max(zValues)
+        # print(zValues)
+
+        triangleSegments = []
+        for i in range(len(triangleCoords)-1):
+            segment = LineString([Point(triangleCoords[i]), Point(triangleCoords[i+1])])
+            # segment = LineString([Point(voronoiCoordinates[i][0], voronoiCoordinates[i][1]), Point(
+            #     voronoiCoordinates[i+1][0], voronoiCoordinates[i+1][1])])
+            triangleSegments.append(segment)
+
+        # could check if all breaks are above the max or all breaks below the min, later
+        # TODO
+        for value in breaks:  # iterate over every traingle just once, but check for every break
+            # print('-- {}'.format(value))
+            pointList = []
+            if value >= zMin and value <= zMax:
+                # break is inside triangle
+                valueCount = zValues.count(value)
+                if valueCount != 3:
+                    # traingle not horizontal
+                    if valueCount == 2:
+                        # one edge is simply the contour segment
+                        # print('edge is segment')
+                        for segment in triangleSegments:
+                            if segment.coords[0][2] == segment.coords[1][2]:
+                                # this is the exact isobath
+                                # print(segment)
+                                contour_lines.append([segment, value])
+
+                    elif valueCount == 1:
+                        # may be tocuhing, or intersectecs to the opposite
+                        if value != zMin and value != zMax:
+                            # opposite intersect + vertex
+                            # print('vertex + opposite')
+
+                            for segment in triangleSegments:
+                                xOne, yOne, zOne = segment.coords[0][0], segment.coords[0][1], segment.coords[0][2]
+                                xTwo, yTwo, zTwo = segment.coords[1][0], segment.coords[1][1], segment.coords[1][2]
+                                sMin, sMax = min(zOne, zTwo), max(zOne, zTwo)
+                                if zOne == value:
+                                    pointList.append(Point(xOne, yOne))
+                                    #print(xOne, yOne)
+                                if sMin < value < sMax:  # !!! not being the precise vertex
+                                    x = (value*xTwo-value*xOne-zOne*xTwo+zTwo*xOne)/(zTwo-zOne)
+                                    y = (x*(yTwo-yOne)-xOne*yTwo+xTwo*yOne)/(xTwo-xOne)
+                                    #print(x, y)
+                                    pointList.append(Point(x, y))
+
+                    else:
+                        # needs interpolation
+                        # print('interpolated segment')
+                        #pX, pY, qX, qY
+                        for segment in triangleSegments:
+                            xOne, yOne, zOne = segment.coords[0][0], segment.coords[0][1], segment.coords[0][2]
+                            xTwo, yTwo, zTwo = segment.coords[1][0], segment.coords[1][1], segment.coords[1][2]
+                            sMin, sMax = min(zOne, zTwo), max(zOne, zTwo)
+                            if sMin <= value <= sMax:
+                                x = (value*xTwo-value*xOne-zOne*xTwo+zTwo*xOne)/(zTwo-zOne)
+                                y = (x*(yTwo-yOne)-xOne*yTwo+xTwo*yOne)/(xTwo-xOne)
+                                #print(x, y)
+                                pointList.append(Point(x, y))
+                        # print(pointList)
+
+            # add the actual isobath-segments
+            if not len(pointList) == 0:
+                # print(LineString(pointList).coords[0])
+                # print(value)
+                contour_lines.append([LineString(pointList), value])
+                #save_shp(LineString(pointList), value)
+    save_shp(contour_lines)
+
+    return
+
+
+def save_shp(contourList):
+
+    # Here's an example Shapely geometry
+    poly = Polygon([(0, 0), (0, 1), (1, 1), (0, 0)])
+
+    # Now convert it to a shapefile with OGR
+    driver = osgeo.ogr.GetDriverByName('Esri Shapefile')
+    ds = driver.CreateDataSource('manual_contours.shp')
+    layer = ds.CreateLayer('', None, osgeo.ogr.wkbLineString)
+    # Add one attribute
+    layer.CreateField(osgeo.ogr.FieldDefn('depth', osgeo.ogr.OFTReal))
+    defn = layer.GetLayerDefn()
+
+    # If there are multiple geometries, put the "for" loop here
+
+    for entry in contourList:
+
+        # Create a new feature (attribute and geometry)
+        feat = osgeo.ogr.Feature(defn)
+        feat.SetField('depth', entry[1])
+
+        # Make a geometry, from Shapely object
+        geom = osgeo.ogr.CreateGeometryFromWkb(entry[0].wkb)
+        feat.SetGeometry(geom)
+
+        layer.CreateFeature(feat)
+        feat = geom = None  # destroy these
+
+    # Save and close everything
+    ds = layer = feat = geom = None
+
+    return
