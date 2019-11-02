@@ -1,3 +1,16 @@
+  
+  # quickstart
+  - createdb
+  - create extension postgis;
+  - -load input.shp
+  - -status m / -vis m
+  - -tri -vor -wt
+  - -cout contours_original.shp -c 99901 (shortcut for a set of isobaths)
+  - inter [iterations]
+  - -cout contours_generalised.shp -c 99901
+  
+
+```
 usage: pysurfonoi.py [-h] [-dft] [-db DB] [-u U] [-pw PW] [-load input.shp]
                      [-loadmask input.shp] [-status STATUS] [-vis {m,d,v}]
                      [-tri] [-vor] [-wt] [-cont] [-inter INTER] [-resetinter]
@@ -36,13 +49,5 @@ optional arguments:
                         contour shapefile
   -c C [C ...]          isobaths values
   
-  # quickstart
-  - createdb
-  - create extension postgis;
-  - -load input.shp
-  - -status m / -vis m
-  - -tri -vor -wt
-  - -cout contours_original.shp -c 99901 (shortcut for a set of isobaths)
-  - inter [iterations]
-  - -cout contours_generalised.shp -c 99901
-  
+  ```
+
