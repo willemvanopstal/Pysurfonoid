@@ -3,18 +3,19 @@
 # preliminaries:
 # createdb -U [user] [dbname]
 # psql -U [user] -d [dbname] -c "CREATE EXTENSION postgis;"
-# add functions contour_lines + helper function
+# (add functions contour_lines + helper function)
 
 import psycopg2
 import osgeo.ogr
 import shapely
 import shapely.wkt
-from shapely.geometry import Point, LineString, Polygon
+from shapely.geometry import Point, LineString, Polygon, MultiLineString
 import numpy as np
 
 import sys
 import subprocess
 import os
+import time
 
 import geopandas as gpd
 import matplotlib as mpl
@@ -38,13 +39,21 @@ def are_perpendicular(lineOne, lineTwo):
     return orthoValue
 
 
-def progressBar(value, endvalue, bar_length=30):
+def progressBar(value, endvalue, startTime, currentTime, bar_length=30):
     # https://stackoverflow.com/a/37630397
+    elapsedTime = currentTime - startTime
     percent = float(value) / endvalue
+    if percent != 0:
+        remainingTime = round((elapsedTime/(percent*100)*100-elapsedTime)/60, 2)
+    else:
+        remainingTime = 99.9
+    remMin = round(remainingTime - (remainingTime % 1))
+    remSec = round((remainingTime % 1)*60)
     arrow = '#' * int(round(percent * bar_length))  # + '>'
     spaces = ' ' * (bar_length - len(arrow))
 
-    sys.stdout.write("\rProgress: [{0}] {1}%".format(arrow + spaces, int(round(percent * 100))))
+    sys.stdout.write("\rProgress: [{0}] {1}% Remaining: {2} min {3} sec".format(
+        arrow + spaces, int(round(percent * 100)), remMin, remSec))
     sys.stdout.flush()
 
 
@@ -70,6 +79,7 @@ def load_measurements(dbName, dbUser, dbPass, inputMeasurements):
     cursor.execute('DROP TABLE IF EXISTS measurements')
     cursor.execute(
         'CREATE TABLE measurements (id SERIAL PRIMARY KEY, pos GEOMETRY, depth NUMERIC)')
+    cursor.execute('DROP TABLE IF EXISTS interpolated_depths')
     cursor.execute('CREATE INDEX measurements_index ON measurements USING GIST(pos)')
 
     # load points from shapefile
@@ -85,6 +95,7 @@ def load_measurements(dbName, dbUser, dbPass, inputMeasurements):
             "INSERT INTO measurements (pos, depth) VALUES (ST_GeomFromText('{}'), {})".format(wkt, depth))
 
     connection.commit()
+    cursor.execute("SELECT id, pos, depth INTO interpolated_depths FROM measurements")
 
     return
 
@@ -240,10 +251,12 @@ def establish_worker_table(dbName, dbUser, dbPass):
     print('> iterating over every measurement..')
 
     nr = 0
+    startTime = time.time()
     for measurement in cursor.fetchall():
 
         # print progress
-        progressBar(nr, nrMeasurements)
+        currentTime = time.time()
+        progressBar(nr, nrMeasurements, startTime, currentTime)
 
         # select the measurement
         cursor.execute(
@@ -371,9 +384,12 @@ def manual_contours(dbName, dbUser, dbPass, outputFile, breaks):
     connection, cursor = db_connection(dbName, dbUser, dbPass)
 
     cursor.execute(
-        'SELECT ST_AsText((ST_Dump(geom)).geom) As triangle FROM(SELECT ST_DelaunayTriangles(ST_Collect(ST_MakePoint(ST_X(pos), ST_Y(pos), depth))) As geom FROM measurements) AS foo')
+        'SELECT ST_AsText((ST_Dump(geom)).geom) As triangle FROM(SELECT ST_DelaunayTriangles(ST_Collect(ST_MakePoint(ST_X(pos), ST_Y(pos), depth))) As geom FROM interpolated_depths) AS foo')
 
     contour_lines = []
+    contoursDict = {}
+    for value in breaks:
+        contoursDict[value] = []
     for tri in cursor.fetchall():
         # print('\n---NEW TRIANGLE---')
         # print(tri[0])
@@ -408,7 +424,10 @@ def manual_contours(dbName, dbUser, dbPass, outputFile, breaks):
                             if segment.coords[0][2] == segment.coords[1][2]:
                                 # this is the exact isobath
                                 # print(segment)
-                                contour_lines.append([segment, value])
+                                if segment.coords[0][2] == zMin:
+                                    # double sided
+                                    contour_lines.append([segment, value])
+                                    contoursDict[value].append(segment)
 
                     elif valueCount == 1:
                         # may be tocuhing, or intersectecs to the opposite
@@ -422,17 +441,17 @@ def manual_contours(dbName, dbUser, dbPass, outputFile, breaks):
                                 sMin, sMax = min(zOne, zTwo), max(zOne, zTwo)
                                 if zOne == value:
                                     pointList.append(Point(xOne, yOne))
-                                    #print(xOne, yOne)
+                                    # print(xOne, yOne)
                                 if sMin < value < sMax:  # !!! not being the precise vertex
                                     x = (value*xTwo-value*xOne-zOne*xTwo+zTwo*xOne)/(zTwo-zOne)
                                     y = (x*(yTwo-yOne)-xOne*yTwo+xTwo*yOne)/(xTwo-xOne)
-                                    #print(x, y)
+                                    # print(x, y)
                                     pointList.append(Point(x, y))
 
                     else:
                         # needs interpolation
                         # print('interpolated segment')
-                        #pX, pY, qX, qY
+                        # pX, pY, qX, qY
                         for segment in triangleSegments:
                             xOne, yOne, zOne = segment.coords[0][0], segment.coords[0][1], segment.coords[0][2]
                             xTwo, yTwo, zTwo = segment.coords[1][0], segment.coords[1][1], segment.coords[1][2]
@@ -440,7 +459,7 @@ def manual_contours(dbName, dbUser, dbPass, outputFile, breaks):
                             if sMin <= value <= sMax:
                                 x = (value*xTwo-value*xOne-zOne*xTwo+zTwo*xOne)/(zTwo-zOne)
                                 y = (x*(yTwo-yOne)-xOne*yTwo+xTwo*yOne)/(xTwo-xOne)
-                                #print(x, y)
+                                # print(x, y)
                                 pointList.append(Point(x, y))
                         # print(pointList)
 
@@ -449,26 +468,39 @@ def manual_contours(dbName, dbUser, dbPass, outputFile, breaks):
                 # print(LineString(pointList).coords[0])
                 # print(value)
                 contour_lines.append([LineString(pointList), value])
-                #save_shp(LineString(pointList), value)
-    save_shp(contour_lines)
+                contoursDict[value].append(LineString(pointList))
+                # save_shp(LineString(pointList), value)
+
+    save_shp(outputFile, contoursDict)  # contour_lines)
 
     return
 
 
-def save_shp(contourList):
+def save_shp(outFile, contourDict):
 
     # Here's an example Shapely geometry
     poly = Polygon([(0, 0), (0, 1), (1, 1), (0, 0)])
 
     # Now convert it to a shapefile with OGR
     driver = osgeo.ogr.GetDriverByName('Esri Shapefile')
-    ds = driver.CreateDataSource('manual_contours.shp')
+    ds = driver.CreateDataSource(outFile)
     layer = ds.CreateLayer('', None, osgeo.ogr.wkbLineString)
     # Add one attribute
     layer.CreateField(osgeo.ogr.FieldDefn('depth', osgeo.ogr.OFTReal))
     defn = layer.GetLayerDefn()
 
     # If there are multiple geometries, put the "for" loop here
+    contourList = []
+    for value in contourDict.keys():
+        multiLine = MultiLineString(contourDict[value])
+        mergedLine = shapely.ops.linemerge(multiLine)
+        # print(type(mergedLine))
+        if type(mergedLine) == shapely.geometry.linestring.LineString:
+            contourList.append([mergedLine, value])
+        else:
+            for line in mergedLine:
+                # print(line)
+                contourList.append([line, value])
 
     for entry in contourList:
 
@@ -485,5 +517,54 @@ def save_shp(contourList):
 
     # Save and close everything
     ds = layer = feat = geom = None
+
+    return
+
+
+def reset_interpolate(dbName, dbUser, dbPass):
+    connection, cursor = db_connection(dbName, dbUser, dbPass)
+    cursor.execute(
+        "drop table interpolated_depths;select * into interpolated_depths from measurements;select * from interpolated_depths")
+    connection.commit()
+    return
+
+
+def interpolate(dbName, dbUser, dbPass, iterations):
+    # creates delaunay triangles and stores the polygons into table delaunay_cells
+    connection, cursor = db_connection(dbName, dbUser, dbPass)
+
+    i = 0
+    for i in range(iterations):
+
+        # mid, interpolated_depth, current_depth
+        # maybe change: interpolated_depths m > measurements m
+        cursor.execute('''SELECT interdepths.mid, interdepths.depth_interpolated, interpolated_depths.depth, interpolated_depths.pos
+        FROM
+    	(SELECT i.mid, SUM((i.distance_v/i.distance_d)*m.depth)/SUM((i.distance_v/i.distance_d)) depth_interpolated
+    	FROM (interpolator i
+    		JOIN
+    		interpolated_depths m
+    		ON i.neighbor_id = m.id)
+    	GROUP BY i.mid
+    	ORDER BY i.mid) as interdepths
+
+    	JOIN interpolated_depths
+    	ON interdepths.mid = interpolated_depths.id
+    	ORDER BY interdepths.mid;''')
+
+        updated = 0
+        for row in cursor.fetchall():
+            # print(row)
+            if row[1] < row[2]:
+                updated += 1
+                # lesser depth
+                # print(row[0], row[1])
+                cursor.execute(
+                    "UPDATE interpolated_depths SET depth = {} WHERE id = {}".format(row[1], row[0]))
+                # cursor.execute(
+                #     "INSERT INTO delaunay_cells (geom) VALUES (ST_GeomFromText('{}'))".format(tri[0]))
+
+        connection.commit()
+        print('iteration: {}, updated: {}'.format(i, updated))
 
     return
