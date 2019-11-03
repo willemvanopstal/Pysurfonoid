@@ -96,6 +96,7 @@ def load_measurements(dbName, dbUser, dbPass, inputMeasurements):
 
     connection.commit()
     cursor.execute("SELECT id, pos, depth INTO interpolated_depths FROM measurements")
+    connection.commit()
 
     return
 
@@ -529,7 +530,7 @@ def reset_interpolate(dbName, dbUser, dbPass):
     return
 
 
-def interpolate(dbName, dbUser, dbPass, iterations):
+def interpolate_old(dbName, dbUser, dbPass, iterations):
     # creates delaunay triangles and stores the polygons into table delaunay_cells
     connection, cursor = db_connection(dbName, dbUser, dbPass)
 
@@ -566,5 +567,42 @@ def interpolate(dbName, dbUser, dbPass, iterations):
 
         connection.commit()
         print('iteration: {}, updated: {}'.format(i, updated))
+
+    return
+
+
+def interpolate(dbName, dbUser, dbPass, iterations):
+    # creates delaunay triangles and stores the polygons into table delaunay_cells
+    connection, cursor = db_connection(dbName, dbUser, dbPass)
+
+    i = 0
+    for i in range(iterations):
+
+        # mid, interpolated_depth, current_depth
+        # maybe change: interpolated_depths m > measurements m
+        cursor.execute('''--SELECT interdepths.mid, interdepths.depth_interpolated, interpolated_depths.depth, LEAST(interdepths.depth_interpolated, interpolated_depths.depth) new_depth, interpolated_depths.pos
+        SELECT interdepths.mid id, LEAST(interdepths.depth_interpolated, interpolated_depths.depth) depth, interpolated_depths.pos
+        INTO interpolated_depths_sep
+        FROM
+            	(SELECT i.mid, ROUND(SUM((i.distance_v/i.distance_d)*m.depth)/SUM((i.distance_v/i.distance_d)),5) depth_interpolated
+            	FROM (interpolator i
+            		JOIN
+            		interpolated_depths m
+            		ON i.neighbor_id = m.id)
+            	GROUP BY i.mid
+            	ORDER BY i.mid) as interdepths
+
+            	JOIN interpolated_depths
+            	ON interdepths.mid = interpolated_depths.id
+        ORDER BY interdepths.mid;''')
+
+        connection.commit()
+        cursor.execute('DROP TABLE interpolated_depths;')
+        connection.commit()
+        cursor.execute('SELECT * INTO interpolated_depths FROM interpolated_depths_sep;')
+        cursor.execute('DROP TABLE interpolated_depths_sep;')
+        connection.commit()
+
+        print('iteration: {}'.format(i))
 
     return
